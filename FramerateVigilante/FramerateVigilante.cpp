@@ -4,6 +4,7 @@
 #include "CWorld.h"
 #include "CTimer.h"
 #include "CRunningScript.h"
+#include <cmath>
 
 using namespace plugin;
 using namespace injector;
@@ -25,6 +26,13 @@ public:
 	static inline int _lastFpsLimit;
 	static inline int _refreshRate;
 	static inline bool _autoLimitFPS;
+
+	// In-air vehicle steering sensitivity: ms_fTimeStep scaler = 60 / AirSteeringFPS (default 60)
+	static inline int airSteeringFPS = 60;
+	static inline float airSteeringScale = 60.0f / 50.0f;
+
+	// Ground angular velocity damping: reference FPS for per-second rate (default 60)
+	static inline int groundAngDampFPS = 60;
 
 	union {
 		int _isOnFlagsInt;
@@ -59,6 +67,19 @@ public:
 			void operator()(reg_pack& regs)
 			{
 				asm_fld(CTimer::ms_fTimeStep / magic);
+			}
+		};
+
+		// In-air vehicle steering sensitivity scaler.
+		// Multiplies ms_fTimeStep by (60 / AirSteeringFPS) to match
+		// the configured FPS baseline at any actual framerate.
+
+		struct AirSteerScaledFLD
+		{
+			void operator()(reg_pack& regs)
+			{
+				float f = CTimer::ms_fTimeStep * airSteeringScale;
+				asm_fld(f);
 			}
 		};
 
@@ -112,6 +133,22 @@ public:
 
 			_autoLimitFPS = ini.ReadInteger("Settings", "AutoLimitFPS", 0);
 
+			// In-air vehicle steering reference FPS (default 60, range 30-100)
+			{
+				int asFPS = ini.ReadInteger("Settings", "AirSteeringFPS", 60);
+				if (asFPS < 30) asFPS = 30;
+				if (asFPS > 100) asFPS = 100;
+				airSteeringFPS = asFPS;
+				airSteeringScale = 60.0f / (float)asFPS;
+			}
+
+			// Ground angular velocity damping reference FPS (default 60, range 30-100)
+			{
+				int gdFPS = ini.ReadInteger("Settings", "GroundAngDampFPS", 60);
+				if (gdFPS < 30) gdFPS = 30;
+				if (gdFPS > 100) gdFPS = 100;
+				groundAngDampFPS = gdFPS;
+			}
 
 			struct AimingRifleWalkFix
 			{
@@ -447,6 +484,92 @@ public:
 					regs.eax = *(uint32_t*)(regs.esp + 0xB0 - 0x90 + 0x4); //mov     eax, [esp+0B0h+out_result.y]
 				}
 			}; MakeInline<PedPushCarForce>(0x549652, 0x549652 + 8);
+
+
+			// ================================================================
+			// In-Air Vehicle Steering Framerate Fix (pitch / yaw / roll)
+			// Multiplies ms_fTimeStep by airSteeringScale = 60 / AirSteeringFPS
+			// so per-second torque matches the configured FPS baseline at any
+			// actual framerate. Combined with GroundAngDampFPS fix below,
+			// this makes vehicle angular physics truly framerate-independent.
+			// ================================================================
+
+			// --- Pitch (Up/Down) and Yaw (Space + A/D) in CAutomobile::ProcessAI ---
+
+			MakeInline<AirSteerScaledFLD>(0x6B515B, 0x6B515B + 6); // fld ms_fTimeStep → pitch torque
+			MakeInline<AirSteerScaledFLD>(0x6B4FED, 0x6B4FED + 6); // fld ms_fTimeStep → yaw (handbrake path)
+			MakeInline<AirSteerScaledFLD>(0x6B508D, 0x6B508D + 6); // fld ms_fTimeStep → yaw (accelerate path)
+
+
+			// --- Roll (A/D without handbrake) in CAutomobile::ProcessControlInputs ---
+			// Only affects steering when all wheels off ground (in the air).
+			// On ground, original ms_fTimeStep is used (already framerate-independent).
+
+			struct SteerAngleAirFixA
+			{
+				void operator()(reg_pack& regs)
+				{
+					CAutomobile* automobile = (CAutomobile*)regs.esi;
+					float f = automobile->GetAllWheelsOffGround() ? CTimer::ms_fTimeStep * airSteeringScale : CTimer::ms_fTimeStep;
+					regs.ecx = *(uint32_t*)&f;
+				}
+			}; MakeInline<SteerAngleAirFixA>(0x6AD831, 0x6AD831 + 6);
+
+			struct SteerAngleAirFixB
+			{
+				void operator()(reg_pack& regs)
+				{
+					CAutomobile* automobile = (CAutomobile*)regs.esi;
+					float f = automobile->GetAllWheelsOffGround() ? CTimer::ms_fTimeStep * airSteeringScale : CTimer::ms_fTimeStep;
+					regs.eax = *(uint32_t*)&f;
+				}
+			}; MakeInline<SteerAngleAirFixB>(0x6AD8F0, 0x6AD8F0 + 5);
+
+			// Steering return damping (pow-based decay), in-air only
+			struct SteerAngleDampFix
+			{
+				void operator()(reg_pack& regs)
+				{
+					CAutomobile* automobile = (CAutomobile*)regs.esi;
+					float f = automobile->GetAllWheelsOffGround() ? CTimer::ms_fTimeStep * airSteeringScale : CTimer::ms_fTimeStep;
+					asm_fld(f);
+				}
+			}; MakeInline<SteerAngleDampFix>(0x6AD8D7, 0x6AD8D7 + 6);
+
+
+			// --- Wheel rotation physics (affects in-air spin / body torque) ---
+
+			// CVehicle::ProcessWheelRotation: replaces fdiv [esp+arg_C] and fchs
+			struct ProcessWheelRotationFix
+			{
+				void operator()(reg_pack& regs)
+				{
+					float arg_C = *(float*)(regs.esp + 0x10);
+					float newArg = arg_C * CTimer::ms_fTimeStep * airSteeringScale;
+					asm_fdiv(newArg);
+					asm_fmul(-1.0f);  // replaces fchs that was at 0x6D125C
+				}
+			}; MakeInline<ProcessWheelRotationFix>(0x6D1258, 0x6D1258 + 6);
+
+			// ================================================================
+			// Ground Angular Velocity Damping Fix (ApplyAirResistance Branch B)
+			// Replaces fixed-per-frame fmul 0.99 with pow(0.99, ms_fTimeStep *
+			// GroundAngDampFPS/50) so per-second damping rate stays constant
+			// regardless of actual framerate. Fixes countersteering difficulty
+			// at high FPS during drifting.
+			// ================================================================
+
+			struct AirResistanceAngDampFix
+			{
+				void operator()(reg_pack& regs)
+				{
+					float damp = powf(0.99f, CTimer::ms_fTimeStep * (groundAngDampFPS / 50.0f));
+					asm_fmul(damp);
+				}
+			}; MakeInline<AirResistanceAngDampFix>(0x544D2C, 0x544D2C + 6); // angVel.x
+			MakeInline<AirResistanceAngDampFix>(0x544D38, 0x544D38 + 6); // angVel.y
+			MakeInline<AirResistanceAngDampFix>(0x544D44, 0x544D44 + 6); // angVel.z
+
 		#endif
 
 		#if defined(GTASA)
